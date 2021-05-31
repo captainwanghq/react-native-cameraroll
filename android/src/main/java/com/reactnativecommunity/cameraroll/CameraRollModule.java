@@ -7,9 +7,13 @@
 
 package com.reactnativecommunity.cameraroll;
 
+import android.Manifest;
+import android.app.Activity;
 import android.content.ContentResolver;
 import android.content.ContentUris;
+import android.content.ContentValues;
 import android.content.Context;
+import android.content.pm.PackageManager;
 import android.content.res.AssetFileDescriptor;
 import android.database.Cursor;
 import android.graphics.BitmapFactory;
@@ -17,11 +21,15 @@ import android.media.MediaMetadataRetriever;
 import android.media.MediaScannerConnection;
 import android.net.Uri;
 import android.os.AsyncTask;
+import android.os.Build;
 import android.os.Environment;
+import android.os.FileUtils;
 import android.provider.MediaStore;
 import android.provider.MediaStore.Images;
 import android.text.TextUtils;
 import android.media.ExifInterface;
+
+import androidx.core.app.ActivityCompat;
 
 import com.facebook.common.logging.FLog;
 import com.facebook.react.bridge.GuardedAsyncTask;
@@ -40,19 +48,26 @@ import com.facebook.react.bridge.WritableNativeArray;
 import com.facebook.react.bridge.WritableNativeMap;
 import com.facebook.react.common.ReactConstants;
 import com.facebook.react.module.annotations.ReactModule;
+import com.facebook.react.modules.core.PermissionAwareActivity;
+import com.facebook.react.modules.core.PermissionListener;
 
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
+import java.net.FileNameMap;
+import java.net.URLConnection;
 import java.nio.channels.FileChannel;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.HashMap;
 import java.util.Set;
+import java.util.concurrent.Callable;
 
 import javax.annotation.Nullable;
 
@@ -80,7 +95,9 @@ public class CameraRollModule extends ReactContextBaseJavaModule {
   private static final String INCLUDE_LOCATION = "location";
   private static final String INCLUDE_IMAGE_SIZE = "imageSize";
   private static final String INCLUDE_PLAYABLE_DURATION = "playableDuration";
-
+  private static final String E_NO_LIBRARY_PERMISSION_KEY = "E_NO_LIBRARY_PERMISSION";
+  private static final String E_NO_LIBRARY_PERMISSION_MSG = "User did not grant library permission.";
+  private static final String E_CALLBACK_ERROR = "E_CALLBACK_ERROR";
   private static final String[] PROJECTION = {
     Images.Media._ID,
     Images.Media.MIME_TYPE,
@@ -116,8 +133,69 @@ public class CameraRollModule extends ReactContextBaseJavaModule {
    */
   @ReactMethod
   public void saveToCameraRoll(String uri, ReadableMap options, Promise promise) {
-    new SaveToCameraRoll(getReactApplicationContext(), Uri.parse(uri), options, promise)
-        .executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR);
+    Activity activity = this.getCurrentActivity();
+    permissionsCheck(activity, promise, Collections.singletonList(Manifest.permission.WRITE_EXTERNAL_STORAGE), new Callable<Void>() {
+      @Override
+      public Void call() {
+        new SaveToCameraRoll(getReactApplicationContext(), Uri.parse(uri), options, promise)
+                .executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR);
+        return null;
+      }
+    });
+  }
+  private void permissionsCheck(final Activity activity, final Promise promise, final List<String> requiredPermissions, final Callable<Void> callback) {
+
+    List<String> missingPermissions = new ArrayList<>();
+
+    for (String permission : requiredPermissions) {
+      int status = ActivityCompat.checkSelfPermission(activity, permission);
+      if (status != PackageManager.PERMISSION_GRANTED) {
+        missingPermissions.add(permission);
+      }
+    }
+    if (!missingPermissions.isEmpty()) {
+
+      ((PermissionAwareActivity) activity).requestPermissions(missingPermissions.toArray(new String[missingPermissions.size()]), 1, new PermissionListener() {
+
+        @Override
+        public boolean onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+          if (requestCode == 1) {
+
+            for (int permissionIndex = 0; permissionIndex < permissions.length; permissionIndex++) {
+              String permission = permissions[permissionIndex];
+              int grantResult = grantResults[permissionIndex];
+
+              if (grantResult == PackageManager.PERMISSION_DENIED) {
+                if (permission.equals(Manifest.permission.WRITE_EXTERNAL_STORAGE)) {
+                  promise.reject(E_NO_LIBRARY_PERMISSION_KEY, E_NO_LIBRARY_PERMISSION_MSG);
+                } else {
+                  // should not happen, we fallback on E_NO_LIBRARY_PERMISSION_KEY rejection for minimal consistency
+                  promise.reject(E_NO_LIBRARY_PERMISSION_KEY, "Required permission missing");
+                }
+                return true;
+              }
+            }
+
+            try {
+              callback.call();
+            } catch (Exception e) {
+              promise.reject(E_CALLBACK_ERROR, "Unknown error", e);
+            }
+          }
+
+          return true;
+        }
+      });
+
+      return;
+    }
+
+    // all permissions granted
+    try {
+      callback.call();
+    } catch (Exception e) {
+      promise.reject(E_CALLBACK_ERROR, "Unknown error", e);
+    }
   }
 
   private static class SaveToCameraRoll extends GuardedAsyncTask<Void, Void> {
@@ -135,93 +213,131 @@ public class CameraRollModule extends ReactContextBaseJavaModule {
       mOptions = options;
     }
 
+    private  static String getMimeType(File file)
+    {
+      FileNameMap fileNameMap = URLConnection.getFileNameMap();
+      String type = fileNameMap.getContentTypeFor(file.getName());
+      return type;
+    }
     @Override
     protected void doInBackgroundGuarded(Void... params) {
-      File source = new File(mUri.getPath());
-      FileChannel input = null, output = null;
-      try {
-        boolean isAlbumPresent = !"".equals(mOptions.getString("album"));
-        
-        final File environment;
-        // Media is not saved into an album when using Environment.DIRECTORY_DCIM.
-        if (isAlbumPresent) {
-          if ("video".equals(mOptions.getString("type"))) {
-            environment = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES);
-          } else {
-            environment = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES);
-          }
-        } else {
-          environment = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM);
-        }
 
-        File exportDir;
-        if (isAlbumPresent) {
-          exportDir = new File(environment, mOptions.getString("album"));
-          if (!exportDir.exists() && !exportDir.mkdirs()) {
-            mPromise.reject(ERROR_UNABLE_TO_LOAD, "Album Directory not created. Did you request WRITE_EXTERNAL_STORAGE?");
-            return;
-          }
-        } else {
-          exportDir = environment;
-        }
-
-        if (!exportDir.isDirectory()) {
+      if(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
+      {
+        File file = new File(mUri.getPath());
+        String mimeType = getMimeType(file);
+        String fileName = file.getName();
+        ContentValues values = new ContentValues();
+        values.put(MediaStore.MediaColumns.DISPLAY_NAME,fileName);
+        values.put(MediaStore.MediaColumns.MIME_TYPE, mimeType);
+        values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DCIM);
+        ContentResolver contentResolver = mContext.getContentResolver();
+        Uri uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
+        if(uri == null){
           mPromise.reject(ERROR_UNABLE_TO_LOAD, "External media storage directory not available");
           return;
         }
-        File dest = new File(exportDir, source.getName());
-        int n = 0;
-        String fullSourceName = source.getName();
-        String sourceName, sourceExt;
-        if (fullSourceName.indexOf('.') >= 0) {
-          sourceName = fullSourceName.substring(0, fullSourceName.lastIndexOf('.'));
-          sourceExt = fullSourceName.substring(fullSourceName.lastIndexOf('.'));
-        } else {
-          sourceName = fullSourceName;
-          sourceExt = "";
+        try {
+          OutputStream out = contentResolver.openOutputStream(uri);
+          FileInputStream fis = new FileInputStream(file);
+          FileUtils.copy(fis,out);
+          fis.close();
+          out.close();
+          mPromise.resolve(uri.toString());
+        } catch (IOException e) {
+          e.printStackTrace();
         }
-        while (!dest.createNewFile()) {
-          dest = new File(exportDir, sourceName + "_" + (n++) + sourceExt);
-        }
-        input = new FileInputStream(source).getChannel();
-        output = new FileOutputStream(dest).getChannel();
-        output.transferFrom(input, 0, input.size());
-        input.close();
-        output.close();
+      }
+      else
+      {
 
-        MediaScannerConnection.scanFile(
-            mContext,
-            new String[]{dest.getAbsolutePath()},
-            null,
-            new MediaScannerConnection.OnScanCompletedListener() {
-              @Override
-              public void onScanCompleted(String path, Uri uri) {
-                if (uri != null) {
-                  mPromise.resolve(uri.toString());
-                } else {
-                  mPromise.reject(ERROR_UNABLE_TO_SAVE, "Could not add image to gallery");
-                }
-              }
-            });
-      } catch (IOException e) {
-        mPromise.reject(e);
-      } finally {
-        if (input != null && input.isOpen()) {
-          try {
-            input.close();
-          } catch (IOException e) {
-            FLog.e(ReactConstants.TAG, "Could not close input channel", e);
+        File source = new File(mUri.getPath());
+        FileChannel input = null, output = null;
+        try {
+          boolean isAlbumPresent = !"".equals(mOptions.getString("album"));
+
+          final File environment;
+          // Media is not saved into an album when using Environment.DIRECTORY_DCIM.
+          if (isAlbumPresent) {
+            if ("video".equals(mOptions.getString("type"))) {
+              environment = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES);
+            } else {
+              environment = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES);
+            }
+          } else {
+            environment = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM);
           }
-        }
-        if (output != null && output.isOpen()) {
-          try {
-            output.close();
-          } catch (IOException e) {
-            FLog.e(ReactConstants.TAG, "Could not close output channel", e);
+
+          File exportDir;
+          if (isAlbumPresent) {
+            exportDir = new File(environment, mOptions.getString("album"));
+            if (!exportDir.exists() && !exportDir.mkdirs()) {
+              mPromise.reject(ERROR_UNABLE_TO_LOAD, "Album Directory not created. Did you request WRITE_EXTERNAL_STORAGE?");
+              return;
+            }
+          } else {
+            exportDir = environment;
+          }
+
+          if (!exportDir.isDirectory()) {
+            mPromise.reject(ERROR_UNABLE_TO_LOAD, "External media storage directory not available");
+            return;
+          }
+          File dest = new File(exportDir, source.getName());
+          int n = 0;
+          String fullSourceName = source.getName();
+          String sourceName, sourceExt;
+          if (fullSourceName.indexOf('.') >= 0) {
+            sourceName = fullSourceName.substring(0, fullSourceName.lastIndexOf('.'));
+            sourceExt = fullSourceName.substring(fullSourceName.lastIndexOf('.'));
+          } else {
+            sourceName = fullSourceName;
+            sourceExt = "";
+          }
+          while (!dest.createNewFile()) {
+            dest = new File(exportDir, sourceName + "_" + (n++) + sourceExt);
+          }
+          input = new FileInputStream(source).getChannel();
+          output = new FileOutputStream(dest).getChannel();
+          output.transferFrom(input, 0, input.size());
+          input.close();
+          output.close();
+
+          MediaScannerConnection.scanFile(
+                  mContext,
+                  new String[]{dest.getAbsolutePath()},
+                  null,
+                  new MediaScannerConnection.OnScanCompletedListener() {
+                    @Override
+                    public void onScanCompleted(String path, Uri uri) {
+                      if (uri != null) {
+                        mPromise.resolve(uri.toString());
+                      } else {
+                        mPromise.reject(ERROR_UNABLE_TO_SAVE, "Could not add image to gallery");
+                      }
+                    }
+                  });
+        } catch (IOException e) {
+          mPromise.reject(e);
+        } finally {
+          if (input != null && input.isOpen()) {
+            try {
+              input.close();
+            } catch (IOException e) {
+              FLog.e(ReactConstants.TAG, "Could not close input channel", e);
+            }
+          }
+          if (output != null && output.isOpen()) {
+            try {
+              output.close();
+            } catch (IOException e) {
+              FLog.e(ReactConstants.TAG, "Could not close output channel", e);
+            }
           }
         }
       }
     }
+
   }
 
   /**
